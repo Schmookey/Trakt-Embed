@@ -1,0 +1,97 @@
+name: Update Trakt Embed HTML
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  update_html:
+    runs-on: ubuntu-latest
+    env: # Define env vars here to be available to all steps
+      TRAKT_CLIENT_ID: ${{ secrets.TRAKT_CLIENT_ID }}
+      TRAKT_ACCESS_TOKEN: ${{ secrets.TRAKT_ACCESS_TOKEN }} # Initial token
+      TRAKT_CLIENT_SECRET: ${{ secrets.TRAKT_CLIENT_SECRET }}
+      TRAKT_REFRESH_TOKEN: ${{ secrets.TRAKT_REFRESH_TOKEN }}
+      TMDB_ACCESS_TOKEN: ${{ secrets.TMDB_ACCESS_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Attempt to update HTML with current token
+        id: initial_update
+        continue-on-error: true # Allow this step to 'fail' (e.g. exit 10)
+        run: python images.py
+
+      - name: Check if token refresh is needed
+        id: check_refresh
+        if: steps.initial_update.outcome == 'failure' && steps.initial_update.outputs.exit_code == 10 # Or parse output
+        # Alternative condition if not using exit codes:
+        # if: steps.initial_update.outcome == 'failure' && contains(steps.initial_update.outputs.stdout, 'TRAKT_ACCESS_TOKEN might be expired')
+        run: echo "Token refresh might be needed."
+
+      - name: Refresh Trakt Token if needed
+        id: refresh_token_step
+        if: steps.check_refresh.conclusion == 'success' # Only run if the check_refresh step ran
+        run: |
+          echo "Attempting to refresh Trakt token..."
+          python refresh_trakt_token.py > refresh_output.txt
+          cat refresh_output.txt # For debugging
+          if grep -q "Error refreshing token" refresh_output.txt; then
+            echo "::error::Failed to refresh Trakt token. See logs above."
+            exit 1
+          fi
+          echo "NEW_ACCESS_TOKEN=$(grep 'NEW_ACCESS_TOKEN=' refresh_output.txt | cut -d'=' -f2)" >> $GITHUB_ENV
+          echo "NEW_REFRESH_TOKEN=$(grep 'NEW_REFRESH_TOKEN=' refresh_output.txt | cut -d'=' -f2)" >> $GITHUB_ENV
+          echo "Token refreshed. New tokens are now in GITHUB_ENV."
+
+      - name: Update GitHub Secrets with new tokens
+        if: steps.refresh_token_step.conclusion == 'success' # Only if refresh was successful
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Needs repo write scope, default for actions
+        run: |
+          echo "Updating GitHub secrets..."
+          # The following gh cli commands require the GITHUB_TOKEN to have `secrets: write` permission for the repository.
+          # This is usually default unless your org has restricted it.
+          # Note: Secrets are only available to subsequent workflow runs, not the current one immediately for other env blocks.
+          # However, setting them to GITHUB_ENV makes them available to subsequent steps in THIS job.
+          gh secret set TRAKT_ACCESS_TOKEN --body "$NEW_ACCESS_TOKEN" --repo $GITHUB_REPOSITORY
+          gh secret set TRAKT_REFRESH_TOKEN --body "$NEW_REFRESH_TOKEN" --repo $GITHUB_REPOSITORY
+          echo "Secrets TRAKT_ACCESS_TOKEN and TRAKT_REFRESH_TOKEN have been updated for future runs."
+          # For the current run, we've set them in GITHUB_ENV, so the next images.py call will use them.
+          export TRAKT_ACCESS_TOKEN="$NEW_ACCESS_TOKEN" # Make available to the next python call
+          export TRAKT_REFRESH_TOKEN="$NEW_REFRESH_TOKEN"
+
+      - name: Run script to update HTML (after potential refresh)
+        id: final_update
+        # Run if initial update succeeded OR if refresh succeeded
+        if: steps.initial_update.outcome == 'success' || steps.refresh_token_step.conclusion == 'success'
+        env: # This ensures the potentially new tokens from GITHUB_ENV are used
+          TRAKT_ACCESS_TOKEN: ${{ env.NEW_ACCESS_TOKEN || secrets.TRAKT_ACCESS_TOKEN }}
+          TRAKT_REFRESH_TOKEN: ${{ env.NEW_REFRESH_TOKEN || secrets.TRAKT_REFRESH_TOKEN }}
+        run: |
+          echo "Running images.py with effective access token: $TRAKT_ACCESS_TOKEN"
+          python images.py
+
+      - name: Commit and push if changed
+        if: steps.final_update.outcome == 'success' # Only commit if final update was successful
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add trakt_embed.html
+          if git diff --staged --quiet; then
+            echo "No changes to trakt_embed.html to commit."
+          else
+            git commit -m "Automated update: trakt_embed.html"
+            git push
+          fi

@@ -2,6 +2,8 @@ import requests
 import os
 from dotenv import load_dotenv
 from datetime import datetime
+import sys
+
 
 # Load environment variables
 load_dotenv()
@@ -37,8 +39,11 @@ def fetch_last_watched(endpoint):
         data = response.json()
         return data[0] if data else None
     else:
-        print(f"Error: {response.status_code}")
+        print(f"Error fetching from {endpoint}: {response.status_code}")
         print(response.text)
+        if response.status_code == 401: # Unauthorized
+            print("TRAKT_ACCESS_TOKEN might be expired or invalid.")
+            sys.exit(10) # Specific exit code for token error
         return None
 
 def get_tmdb_image(tmdb_id, media_type):

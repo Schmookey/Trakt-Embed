@@ -1,3 +1,4 @@
 .env
 .env.bak
 access.py
+.DS_Store
